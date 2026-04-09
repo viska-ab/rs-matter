@@ -28,7 +28,8 @@ use crate::transport::exchange::Exchange;
 
 use super::{
     AttrData, AttrPath, AttrResp, CmdData, CmdPath, CmdResp, DataVersionFilter, EventFilter,
-    EventPath, IMStatusCode, InvokeResp, OpCode, ReportDataResp, StatusResp, TimedReq, WriteResp,
+    EventPath, IMStatusCode, InvokeResp, OpCode, ReportDataResp, StatusResp, SubscribeResp,
+    TimedReq, WriteResp,
 };
 
 /// Builder for constructing ReadRequest messages.
@@ -114,6 +115,60 @@ impl<'a> InvokeRequestBuilder<'a> {
             suppress_response: None,
             timed_request: if timed { Some(true) } else { None },
             invoke_requests,
+        }
+    }
+}
+
+/// Builder for constructing SubscribeRequest messages.
+///
+/// Corresponds to the `SubscribeRequestMessage` TLV structure in the Interaction Model.
+///
+/// Note: Context tag 6 is intentionally skipped per the Matter spec. The
+/// `_skip` field exists solely to advance the derive-assigned context tag
+/// numbering past 6 and must remain `None`.
+#[derive(Debug, Clone, ToTLV)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[tlvargs(lifetime = "'a")]
+pub struct SubscribeRequestBuilder<'a> {
+    /// Whether to keep existing subscriptions for this fabric/peer
+    pub keep_subs: bool,
+    /// Minimum interval floor in seconds
+    pub min_int_floor: u16,
+    /// Maximum interval ceiling in seconds
+    pub max_int_ceil: u16,
+    /// Attribute paths to subscribe to
+    pub attr_requests: Option<&'a [AttrPath]>,
+    /// Event paths to subscribe to
+    pub event_requests: Option<&'a [EventPath]>,
+    /// Event filters
+    pub event_filters: Option<&'a [EventFilter]>,
+    /// Spec-mandated gap at context tag 6 — must always be None
+    pub _skip: Option<bool>,
+    /// Whether to filter results by fabric
+    pub fabric_filtered: bool,
+    /// Data version filters for conditional reads
+    pub dataver_filters: Option<&'a [DataVersionFilter]>,
+}
+
+impl<'a> SubscribeRequestBuilder<'a> {
+    /// Create a new SubscribeRequestBuilder for subscribing to attributes.
+    pub const fn attributes(
+        attr_requests: &'a [AttrPath],
+        min_int_floor: u16,
+        max_int_ceil: u16,
+        keep_subs: bool,
+        fabric_filtered: bool,
+    ) -> Self {
+        Self {
+            keep_subs,
+            min_int_floor,
+            max_int_ceil,
+            attr_requests: Some(attr_requests),
+            event_requests: None,
+            event_filters: None,
+            _skip: None,
+            fabric_filtered,
+            dataver_filters: None,
         }
     }
 }
@@ -357,6 +412,214 @@ impl ImClient {
                     debug!("ImClient::invoke - final chunk, sending standalone ACK");
                     exchange.acknowledge().await?;
                 }
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Subscribe to attributes on a device (initial setup phase).
+    ///
+    /// Sends a SubscribeRequest, processes the initial priming ReportData
+    /// chunks (invoking `on_report` once per chunk), and returns the parsed
+    /// `SubscribeResponse` containing the assigned subscription ID and the
+    /// negotiated maximum interval.
+    #[cfg(feature = "im-client-subscribe")]
+    ///
+    /// After this method returns successfully, the server will send periodic
+    /// `ReportData` updates on **new exchanges** that it initiates on the
+    /// existing session. The caller is responsible for accepting those
+    /// exchanges (e.g. via [`Exchange::accept`]) and dispatching them to
+    /// [`handle_subscription_report`](Self::handle_subscription_report).
+    ///
+    /// # Callback lifetime constraints
+    ///
+    /// Same as [`read`](Self::read) — the `ReportDataResp<'_>` borrows from
+    /// the exchange's RX buffer and only owned/`Copy` data can escape.
+    ///
+    /// # Arguments
+    /// - `exchange` - An established exchange (typically a CASE session)
+    /// - `attr_paths` - Attribute paths to subscribe to
+    /// - `min_int_floor` - Minimum interval between reports, in seconds
+    /// - `max_int_ceil` - Maximum interval between reports, in seconds
+    /// - `keep_subs` - If false, replaces all existing subscriptions for this fabric/peer
+    /// - `fabric_filtered` - Whether to filter results by fabric
+    /// - `on_report` - Callback invoked for each priming ReportData chunk
+    pub async fn subscribe<F>(
+        exchange: &mut Exchange<'_>,
+        attr_paths: &[AttrPath],
+        min_int_floor: u16,
+        max_int_ceil: u16,
+        keep_subs: bool,
+        fabric_filtered: bool,
+        mut on_report: F,
+    ) -> Result<SubscribeResp, Error>
+    where
+        F: FnMut(&ReportDataResp<'_>) -> Result<(), Error>,
+    {
+        let req = SubscribeRequestBuilder::attributes(
+            attr_paths,
+            min_int_floor,
+            max_int_ceil,
+            keep_subs,
+            fabric_filtered,
+        );
+
+        debug!(
+            "ImClient::subscribe - Sending SubscribeRequest on exchange {}",
+            exchange.id()
+        );
+
+        exchange
+            .send_with(|_, wb| {
+                req.to_tlv(&TagType::Anonymous, wb)?;
+                Ok(Some(OpCode::SubscribeRequest.into()))
+            })
+            .await?;
+
+        loop {
+            exchange.recv_fetch().await?;
+
+            // The peer either sends another priming ReportData chunk or, after
+            // all priming chunks are acknowledged, the final SubscribeResponse.
+            // Try to parse SubscribeResponse first; fall back to ReportData.
+            let maybe_subs_resp = {
+                let rx = exchange.rx()?;
+                if rx.meta().proto_opcode == OpCode::SubscribeResponse as u8 {
+                    let element = TLVElement::new(rx.payload());
+                    Some(SubscribeResp::from_tlv(&element)?)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(resp) = maybe_subs_resp {
+                debug!(
+                    "ImClient::subscribe - SubscribeResponse received: subs_id={}, max_int={}",
+                    resp.subs_id, resp.max_int
+                );
+                exchange.acknowledge().await?;
+                return Ok(resp);
+            }
+
+            let (more_chunks, suppress_response, cb_result) = {
+                let rx = exchange.rx()?;
+                Self::check_opcode(rx.meta().proto_opcode, OpCode::ReportData)?;
+
+                let element = TLVElement::new(rx.payload());
+                let resp = ReportDataResp::from_tlv(&element)?;
+
+                let more = resp.more_chunks.unwrap_or(false);
+                let suppress = resp.suppress_response.unwrap_or(false);
+
+                let cb_result = on_report(&resp);
+
+                (more, suppress, cb_result)
+            };
+
+            if let Err(e) = cb_result {
+                Self::send_abort(exchange).await?;
+                return Err(e);
+            }
+
+            if more_chunks {
+                // Request next priming chunk.
+                debug!("ImClient::subscribe - more_chunks=true, sending StatusResponse");
+                exchange
+                    .send_with(|_, wb| {
+                        StatusResp::write(wb, IMStatusCode::Success)?;
+                        Ok(Some(OpCode::StatusResponse.into()))
+                    })
+                    .await?;
+            } else if !suppress_response {
+                // Final priming chunk. The server expects a StatusResponse
+                // before sending the SubscribeResponse (subscriptions always
+                // run with suppress_last_resp=false on the responder side).
+                debug!(
+                    "ImClient::subscribe - final priming chunk, sending StatusResponse and awaiting SubscribeResponse"
+                );
+                exchange
+                    .send_with(|_, wb| {
+                        StatusResp::write(wb, IMStatusCode::Success)?;
+                        Ok(Some(OpCode::StatusResponse.into()))
+                    })
+                    .await?;
+                // Loop back to recv_fetch the SubscribeResponse.
+            } else {
+                // Unexpected for subscriptions — the responder should never set
+                // suppress_response=true on a priming chunk. Bail out cleanly.
+                error!(
+                    "ImClient::subscribe - unexpected suppress_response=true on priming chunk"
+                );
+                exchange.acknowledge().await?;
+                return Err(ErrorCode::InvalidData.into());
+            }
+        }
+    }
+
+    /// Handle a single server-initiated subscription report exchange.
+    ///
+    /// After [`subscribe`](Self::subscribe) completes, the server delivers
+    /// ongoing attribute updates on **new exchanges** initiated from its
+    /// side. The caller accepts each one with [`Exchange::accept`] and
+    /// passes the resulting exchange to this method.
+    ///
+    /// This method handles the full report (chunked or not), invoking
+    /// `on_report` for each chunk and sending `StatusResponse(Success)`
+    /// after each. The exchange is left in a state where the transport
+    /// layer will deliver the server's final MRP ACK; the caller should
+    /// drop the exchange when done.
+    ///
+    /// # Callback lifetime constraints
+    ///
+    /// Same as [`read`](Self::read) — the `ReportDataResp<'_>` borrows
+    /// from the exchange's RX buffer.
+    #[cfg(feature = "im-client-subscribe")]
+    pub async fn handle_subscription_report<F>(
+        exchange: &mut Exchange<'_>,
+        mut on_report: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(&ReportDataResp<'_>) -> Result<(), Error>,
+    {
+        // The exchange may have been freshly accepted (rx already populated)
+        // or may need an initial fetch — handle both cases like dm.rs does.
+        if exchange.rx().is_err() {
+            exchange.recv_fetch().await?;
+        }
+
+        loop {
+            let (more_chunks, cb_result) = {
+                let rx = exchange.rx()?;
+                Self::check_opcode(rx.meta().proto_opcode, OpCode::ReportData)?;
+
+                let element = TLVElement::new(rx.payload());
+                let resp = ReportDataResp::from_tlv(&element)?;
+
+                let more = resp.more_chunks.unwrap_or(false);
+                let cb_result = on_report(&resp);
+
+                (more, cb_result)
+            };
+
+            if let Err(e) = cb_result {
+                Self::send_abort(exchange).await?;
+                return Err(e);
+            }
+
+            // Subscriptions always require StatusResponse(Success) per chunk,
+            // including the final one (responder uses suppress_last_resp=false).
+            exchange
+                .send_with(|_, wb| {
+                    StatusResp::write(wb, IMStatusCode::Success)?;
+                    Ok(Some(OpCode::StatusResponse.into()))
+                })
+                .await?;
+
+            if more_chunks {
+                exchange.recv_fetch().await?;
+            } else {
                 break;
             }
         }
