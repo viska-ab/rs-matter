@@ -48,6 +48,9 @@ pub mod ota_prov;
 pub mod ota_req;
 pub mod power_source;
 pub mod scenes;
+// Viska: Generic Switch (0x003B) server handler. Upstream generates
+// decl::switch from the IDL but ships no handler for it.
+pub mod switch;
 pub mod sw_diag;
 pub mod thread_diag;
 pub mod time_sync;
