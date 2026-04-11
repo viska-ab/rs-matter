@@ -35,6 +35,7 @@ pub mod level_control;
 pub mod net_comm;
 pub mod noc;
 pub mod on_off;
+pub mod switch;
 pub mod thread_diag;
 pub mod unit_testing;
 pub mod wifi_diag;
