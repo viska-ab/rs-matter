@@ -757,9 +757,51 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
             }
             Err(e) if matches!(e.code(), ErrorCode::NoSession) => {
                 warn!(
-                    "\n>>RCV {}\n      => No valid session found, dropping",
+                    "\n>>RCV {}\n      => No valid session found, sending StatusReport(SessionNotFound)",
                     packet
                 );
+
+                // Matter Core §4.10.4.5 / §4.13: when receiving an
+                // encrypted message under a session id we don't have,
+                // reply unsecured with SecureChannel::StatusReport
+                // SessionNotFound so the peer drops its stale session
+                // and starts CASE again immediately. Without this they
+                // sit in their own retry loop for several minutes after
+                // we restart, during which every bridged accessory
+                // shows offline in the Home app. (VIS-225.)
+                let build_result: Result<(), Error> = self.matter.with_state(|state| {
+                    // Original proto header was inside the encrypted
+                    // payload and never decoded — replace with a fresh
+                    // one so write_packet builds a valid unsecured
+                    // message. sess_id=0 makes the encryption check in
+                    // write_packet pass (see plain_hdr::is_encrypted).
+                    packet.header.plain.sess_id = 0;
+                    packet.header.proto = Default::default();
+                    packet.header.proto.exch_id = state.sessions.get_next_exch_id();
+                    packet.header.proto.set_initiator();
+
+                    self.write_packet(packet, None, None, true, |wb| {
+                        sc_write(wb, SCStatusCodes::SessionNotFound, &[])
+                    })
+                });
+
+                match build_result {
+                    Ok(()) => {
+                        Self::netw_send(
+                            send,
+                            packet.peer,
+                            &packet.buf[packet.payload_start..],
+                            true,
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to build SessionNotFound StatusReport reply: {:?}",
+                            e
+                        );
+                    }
+                }
             }
             Err(e) => {
                 error!("\n>>RCV {}\n      => Error ({:?}), dropping", packet, e);

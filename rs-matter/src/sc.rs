@@ -97,8 +97,15 @@ pub enum SCStatusCodes {
 
 impl SCStatusCodes {
     pub fn reliable(&self) -> bool {
-        // CloseSession and Busy are sent without the R flag raised
-        !matches!(self, SCStatusCodes::CloseSession | SCStatusCodes::Busy)
+        // CloseSession + Busy are sent without the R flag raised. So is
+        // SessionNotFound when we emit it as an unsecured reply to an
+        // encrypted message under an unknown SID — the response can't
+        // ride MRP because it has no session counter to ack against.
+        // (Matter Core §4.10.4.5 / VIS-225.)
+        !matches!(
+            self,
+            SCStatusCodes::CloseSession | SCStatusCodes::Busy | SCStatusCodes::SessionNotFound
+        )
     }
 
     pub fn as_report<'a>(&self, payload: &'a [u8]) -> StatusReport<'a> {
